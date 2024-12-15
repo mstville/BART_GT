@@ -1,0 +1,152 @@
+#############################################################################################################
+# BART with Group Testing Example: Unknown testing error rates, 5000 individuals, and the following model
+#
+# logit(P(Y=1|X)) = -sin(X1/3) - sqrt(X1*X3) + X3
+#
+# where X1,X2~Uniform(0,10) and X3~Bernoulli(0.5). Pools of size c=4 are used, under Dorfman's Testing.
+
+#############################################################################################################
+
+# Load R packages
+library(Rcpp) 
+library(msm)
+library(dbarts)
+
+#############################################################
+# Read in needed functions Note: Set R directory accordingly
+source("BART_Up.txt")
+
+
+N=5000                             # Number of in-sample individuals                      
+N.test=0.2*N                       # Number of out-of-sample individuals                        
+c=4                                # Pool size 
+
+
+### Create Dorfman decoding algorithm -- this simulates
+### a group testing data set from Dorfman's testing protocol
+Dorfman.decode.diff.error<-function(Y.true,Se,Sp,cj){
+  N<-length(Y.true)
+  Jmax<-N+N/cj
+  J<-1
+  
+  Y<-matrix(-99,nrow=N, ncol=4)
+  Z<-matrix(-99,nrow=Jmax,ncol=cj+3)
+  
+  
+  for(j in 1:(N/cj)){
+    prob<-ifelse(sum(Y.true[((j-1)*cj+1):(j*cj)])>0,Se[1],1-Sp[1])
+    Z[J,1]<-rbinom(n=1,size=1,prob=prob)
+    Z[J,2]<-cj
+    Z[J,3]<-1
+    Z[J,4:(cj+3)]<-((j-1)*cj+1):(j*cj)
+    Y[((j-1)*cj+1):(j*cj),2]<-1
+    Y[((j-1)*cj+1):(j*cj),3]<-J
+    J<-J+1
+    if(Z[J-1,1]==1){
+      for(k in ((j-1)*cj+1):(j*cj)){
+        prob<-ifelse(Y.true[k]>0,Se[2],1-Sp[2])
+        Z[J,1]<- rbinom(n=1,size=1,prob=prob)
+        Z[J,2]<-1
+        Z[J,3]<-2
+        Z[J,4]<-k
+        Y[k,2]<-2
+        Y[k,4]<-J
+        J<-J+1
+      }
+    }
+  }
+  
+  J<-J-1
+  Z<-Z[1:J,]
+  
+  return(list("Z"=Z, "Y"=Y))
+}
+
+
+### Generate covariates for in- and out-of-sample individuals
+X<-cbind(round(runif(N,0,10),1),
+         round(runif(N,0,10),1),
+         rbinom(N,1,0.5))
+X.test<-cbind(round(runif(N.test,0,10),1),
+              round(runif(N.test,0,10),1),
+              rbinom(N.test,1,0.5))
+
+
+### True parameter values
+Se.true = c(0.95,0.98)                                                     # Sensitivity                      
+Sp.true = c(0.98,0.99)                                                     # Specificity
+
+gtr.t1<- -sin(X[,1]/3)-sqrt(X[,1]*X[,3])+X[,3]                             # function  
+gte.t1<- -sin(X.test[,1]/3)-sqrt(X.test[,1]*X.test[,3])+X.test[,3]         # function out-of-sample                        
+ptr.t1<-pnorm(gtr.t1)                                                      # probabilities
+pte.t1<-pnorm(gte.t1)                                                      # probabilities out-of-sample
+
+
+### Generate true statuses for in- and out-of-sample individuals
+Y.true<-rbinom(N,1,ptr.t1)
+Y.true.te<-rbinom(N.test,1,pte.t1)
+
+
+### Perform Dorfman group testing
+group_data =  Dorfman.decode.diff.error(Y.true,Se.true,Sp.true,c)
+Z = group_data$Z
+Y = group_data$Y
+Y[,1] = Y.true #initializes as diagnose status
+
+
+### Initialize latent variables for BART
+W<-rep(-99,N)
+W[Y.true==1]<-1
+W[Y.true==0]<--1
+
+W.test<-rep(-99,N.test)
+W.test[Y.true.te==1]<-1
+W.test[Y.true.te==0]<--1
+
+
+### Save training and test datasets for BART
+train<-data.frame(cbind(W,X))
+names(train)[2:4]<-c("X1","X2","X3")
+
+test<-data.frame(cbind(W.test,X.test))
+names(test)[2:4]<-c("X1","X2","X3")
+
+
+#############################################################
+### Run BART model with 200 trees
+res<-BART.gt(Z, Y, train, test, GI=5000, na=2, Se=Se.true, Sp=Sp.true, m=200, est.error=TRUE)
+
+
+#############################################################
+### Analyze model results using last half of MCMC chain
+burn = 2501:5000
+
+ghat.tr = apply(res$gmat[burn,],2,mean)                                 ## posterior mean estimates of function (in-sample)
+ghat.ci = apply(res$gmat[burn,],2,quantile,probs=c(0.025,0.975))        ## 95% credible interval
+
+phat.tr = apply(res$pmat[burn,],2,mean)                                 ## posterior mean estimates of probability (in-sample)
+phat.ci = apply(res$pmat[burn,],2,quantile,probs=c(0.025,0.975))        ## 95% credible interval
+
+
+ghat.te = apply(res$gmat.te[burn,],2,mean)                              ## posterior mean estimates of function (out-of-sample)
+ghat.ci.te = apply(res$gmat.te[burn,],2,quantile,probs=c(0.025,0.975))  ## 95% credible interval
+
+phat.te = apply(res$pmat.te[burn,],2,mean)                              ## posterior mean estimates of probability (out-of-sample)
+phat.ci.te = apply(res$pmat.te[burn,],2,quantile,probs=c(0.025,0.975))  ## 95% credible interval
+
+
+Se.hat = apply(res$Se.mat[burn,],2,mean)                                ## Sensitivity posterior mean estimate
+Se.sd = apply(res$Se.mat[burn,],2,sd)                                   ## Sensitivity posterior standard deviation estimate
+Se.ci = apply(res$Se.mat[burn,],2,quantile,probs=c(0.025,0.975))        ## 95% credible interval
+
+
+Sp.hat = apply(res$Sp.mat[burn,],2,mean)                                ## Specificity posterior mean estimate
+Sp.sd = apply(res$Sp.mat[burn,],2,sd)                                   ## Specificity posterior standard deviation estimate
+Sp.ci = apply(res$Sp.mat[burn,],2,quantile,probs=c(0.025,0.975))        ## 95% credible interval
+
+
+varcount = res$varmat[burn,]
+percount = varcount/apply(varcount,1,sum)
+vip = apply(percount,2,mean)                                            ## variable inclusion proportions (use smaller # of trees to analyze variable importance)
+
+
